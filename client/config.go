@@ -9,8 +9,5 @@ var LocalSocks5ServerPort = 1080
 var ServerIP = "127.0.0.1"
 var ServerPort = 5000
 
-// 握手的超时时间
-var WssHandshakeTimeout = time.Second * 5
-
-// 密码
-var Token = "random_string_as_token"
+// 客户端发送心跳包的时间间隔
+var HeartbeatInterval = time.Second * 1

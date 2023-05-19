@@ -2,11 +2,13 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"time"
 	"tls-socks5/comm"
 
 	"github.com/gorilla/websocket"
@@ -14,9 +16,11 @@ import (
 
 func init() {
 	// 这里的握手包括tcp握手+wss握手
-	websocket.DefaultDialer.HandshakeTimeout = WssHandshakeTimeout
+	websocket.DefaultDialer.HandshakeTimeout = comm.WssHandshakeTimeout
 	// 这么做的目的是如果不是权威机构签发的证书也能通过
 	websocket.DefaultDialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: false}
+	// 指定协议
+	websocket.DefaultDialer.Subprotocols = []string{"wsproxy"}
 }
 
 func main() {
@@ -25,7 +29,7 @@ func main() {
 		log.Fatalf("failed to listen tcp: %v\n", err)
 	}
 
-	// 循环接收连接, 比如浏览器, 一些应用程序都会连接本地socks5服务器
+	// 循环接收连接, 比如浏览器, 一些应用程序会连接本地socks5服务器
 	for {
 		tcpConn, err := tcpListener.AcceptTCP()
 		if err != nil {
@@ -40,8 +44,6 @@ func main() {
 		}
 
 		go func() {
-			defer tcpConn.Close()
-
 			/*
 				客户端发来请求
 				+----+----------+----------+
@@ -63,15 +65,18 @@ func main() {
 			_, err := io.ReadFull(tcpConn, verAndNMethods)
 			if err != nil {
 				log.Printf("auth stage: unexpected read error when reading version and nMethods, quiting handler goroutine: %v\n", err)
+				tcpConn.Close()
 				return
 			}
 			version, nMethods := int(verAndNMethods[0]), int(verAndNMethods[1])
 			if version != 5 {
 				log.Printf("auth stage: unsupported protocol version, quiting handler goroutine: %v\n", err)
+				tcpConn.Close()
 				return
 			}
 			if nMethods == 0 {
 				log.Printf("auth stage: protocol error: nMethods is 0, which is impossible, quiting handler goroutine\n")
+				tcpConn.Close()
 				return
 			}
 
@@ -79,6 +84,7 @@ func main() {
 			_, err = io.ReadFull(tcpConn, methodsSupported)
 			if err != nil {
 				log.Printf("auth stage: unexpected read error when reading methodsSupoorted, quiting handler goroutine: %v\n", err)
+				tcpConn.Close()
 				return
 			}
 			var is0x00InMethodsSupported bool = false
@@ -95,6 +101,7 @@ func main() {
 				if err != nil {
 					log.Printf("auth stage: write tcp connetion(to answer 0x05 0xFF to deny service, because client does not support 0x00 error) error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			}
 
@@ -102,6 +109,7 @@ func main() {
 			_, err = tcpConn.Write([]byte{0x05, 0x00})
 			if err != nil {
 				log.Printf("auth stage: write tcp connetion(to answer 0x05 0x00 to accept service) error, quiting handler goroutine: %v\n", err)
+				tcpConn.Close()
 				return
 			}
 
@@ -145,15 +153,18 @@ func main() {
 			_, err = io.ReadFull(tcpConn, verCmdRsvAtyp)
 			if err != nil {
 				log.Printf("request stage: unexpeceted read error, quiting handler goroutine: %v\n", err)
+				tcpConn.Close()
 				return
 			}
 			version, cmd, rsv, atyp := int(verCmdRsvAtyp[0]), int(verCmdRsvAtyp[1]), int(verCmdRsvAtyp[2]), int(verCmdRsvAtyp[3])
 			if verCmdRsvAtyp[0] != 5 {
 				log.Printf("request stage: unexpeceted version(%v), quiting handler goroutine: %v\n", version, err)
+				tcpConn.Close()
 				return
 			}
 			if cmd != 0 && cmd != 1 && cmd != 3 {
 				log.Printf("request stage: protocol error, unkonwn cmd(%v), quiting handler goroutine\n", cmd)
+				tcpConn.Close()
 				return
 			}
 			// 目前只支持connect和udp命令
@@ -164,16 +175,19 @@ func main() {
 			case comm.RequestUDP:
 				requestProtocolType = "udp"
 			default:
-				log.Printf("request stage: now noly cmd 1(tcp) and 3(udp) is supported, but cmd received %v, quiting handler goroutine\n", cmd)
+				log.Printf("request stage: now noly cmd 1(tcp) and 3(udp) are supported, but cmd received %v, quiting handler goroutine\n", cmd)
 				// 出错时, addr为0, port为0即可, atyp无所谓了, 这里写成0(TODO: 是否可以?)
+				// 0x07代表不支持当前cmd
 				_, err := tcpConn.Write([]byte{0x05, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00})
 				if err != nil {
 					log.Printf("request stage: write tcp connetion(to answer 0x05 0x07 to deny service, because server does not support protocol expect for CONNECT) error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			}
 			if rsv != 0 {
 				log.Printf("request stage: unexpeceted rsv(%v), quiting handler goroutine: %v\n", rsv, err)
+				tcpConn.Close()
 				return
 			}
 			// 1: ipv4 2: domain 3: ipv6
@@ -183,6 +197,7 @@ func main() {
 			//		域名要求服务端进行解析
 			if atyp != comm.IPV4 && atyp != comm.Domain && atyp != comm.IPV6 {
 				log.Printf("request stage: unexpeceted atyp(%v), quiting handler goroutine: %v\n", atyp, err)
+				tcpConn.Close()
 				return
 			}
 
@@ -196,6 +211,7 @@ func main() {
 				_, err := io.ReadFull(tcpConn, dstAddrBytes)
 				if err != nil {
 					log.Printf("request stage: unexpeceted read error, quiting handler goroutine: %v\n", err)
+					tcpConn.Close()
 					return
 				}
 			case comm.Domain:
@@ -204,16 +220,19 @@ func main() {
 				_, err := io.ReadFull(tcpConn, nDomainBytes)
 				if err != nil {
 					log.Printf("request stage: unexpeceted read error, quiting handler goroutine: %v\n", err)
+					tcpConn.Close()
 					return
 				}
 				if int(nDomainBytes[0]) == 0 {
 					log.Printf("request stage: unexpeceted domain bytes length(%v), quiting handler goroutine\n", int(nDomainBytes[0]))
+					tcpConn.Close()
 					return
 				}
 				dstAddrBytes = make([]byte, int(nDomainBytes[0]))
 				_, err = io.ReadFull(tcpConn, dstAddrBytes)
 				if err != nil {
 					log.Printf("request stage: unexpeceted read error, quiting handler goroutine: %v\n", err)
+					tcpConn.Close()
 					return
 				}
 			case comm.IPV6:
@@ -222,23 +241,25 @@ func main() {
 				_, err := io.ReadFull(tcpConn, dstAddrBytes)
 				if err != nil {
 					log.Printf("request stage: unexpeceted read error, quiting handler goroutine: %v\n", err)
+					tcpConn.Close()
 					return
 				}
 			}
 
 			// 与服务端正式建立连接
 			extraHeader := http.Header{}
-			extraHeader.Set("Wsproxy-Token", Token)
-			extraHeader.Set("Wsproxy-Protocol", requestProtocolType)
-			extraHeader.Set("Wsproxy-Addr-Type", dstAddrType)
-			extraHeader.Set("Wsproxy-Addr", string(dstAddrBytes))
-			conn, resp, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://%v:%v", ServerIP, ServerPort), extraHeader)
+			extraHeader.Set("Wsproxy-Token", comm.Token)             // 密钥
+			extraHeader.Set("Wsproxy-Protocol", requestProtocolType) // tcp或udp
+			extraHeader.Set("Wsproxy-Addr-Type", dstAddrType)        // ipv4 ipv6或domain
+			extraHeader.Set("Wsproxy-Addr", string(dstAddrBytes))    // 地址, 根据Wsproxy-Addr-Type来
+			wsConn, resp, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://%v:%v", ServerIP, ServerPort), extraHeader)
 			if err != nil {
 				log.Printf("request stage: network error, failed to connect to server, quiting handler goroutine: %v\n", err)
 				_, err := tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00})
 				if err != nil {
 					log.Printf("request stage: write tcp connection error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			}
 
@@ -249,6 +270,7 @@ func main() {
 				if err != nil {
 					log.Printf("request stage: write tcp connection error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			}
 			if len(status) != 1 {
@@ -257,6 +279,7 @@ func main() {
 				if err != nil {
 					log.Printf("request stage: write tcp connection error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			}
 
@@ -267,16 +290,26 @@ func main() {
 				if err != nil {
 					log.Printf("request stage: write tcp connection error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			case comm.StatusConnected:
 				// 连接成功了, 现在可以开始愉快地通讯了
+				// TODO: 这里relay和socks5是同一台服务器, atyp为0, 可行?
+				_, err := tcpConn.Write([]byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+				if err != nil {
+					log.Printf("request stage: write tcp connection error(to enter relay stage), quiting handler goroutine: %v\n", err)
+					return
+				}
+				tcpConn.Close()
 				break
 			case comm.StatusUnexpected:
 				log.Printf("request stage: protocol error, unexpected error, quiting handler goroutine\n")
+				// 0x01代表的是通用的错误, 由于我不想甄别错误, 错误全部都是0x01
 				_, err := tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00})
 				if err != nil {
 					log.Printf("request stage: write tcp connection error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			default:
 				log.Printf("request stage: protocol error, failed to create wss connect to server: unexpected Status header, quiting handler goroutine\n")
@@ -284,10 +317,120 @@ func main() {
 				if err != nil {
 					log.Printf("request stage: write tcp connection error, quiting handler goroutine: %v\n", err)
 				}
+				tcpConn.Close()
 				return
 			}
 
 			// 可以开始进行收发数据了
+			errorChan := make(chan error, 2)
+
+			tcpConnReadChan := make(chan []byte)
+			tcpConnReaderExitChan := make(chan struct{})
+
+			wsConnReadChan := make(chan []byte)
+			wsConnReaderExitChan := make(chan struct{})
+
+			heartbeatTick := time.Tick(time.Second)
+
+			// tcpConnReader
+			go func() {
+				buf := make([]byte, comm.MaxMessageLength, comm.MaxMessageLength)
+				for {
+					n, err := tcpConn.Read(buf)
+					if err != nil {
+						errorChan <- err
+						<-tcpConnReaderExitChan
+						return
+					}
+
+					cpyBuf := make([]byte, n, n)
+					copy(cpyBuf, buf[:n])
+					select {
+					case tcpConnReadChan <- cpyBuf:
+					case <-tcpConnReaderExitChan:
+						return
+					}
+				}
+			}()
+
+			// wsConnReader
+			go func() {
+				for {
+					wsConn.SetReadLimit(int64(comm.MaxMessageLength))
+					wsConn.SetReadDeadline(time.Now().Add(comm.WsConnExchangeReadTimeout))
+					msgTyp, msg, err := wsConn.ReadMessage()
+					if err != nil {
+						errorChan <- err
+						<-wsConnReaderExitChan
+						return
+					}
+					if msgTyp != websocket.BinaryMessage {
+						errorChan <- errors.New(fmt.Sprintf("protocol error: binary message(value is %v) expected, but got %v", websocket.BinaryMessage, msgTyp))
+						<-wsConnReadChan
+						return
+					}
+
+					select {
+					case wsConnReadChan <- msg:
+					case <-tcpConnReaderExitChan:
+						return
+					}
+				}
+			}()
+
+			for {
+				select {
+				case r := <-tcpConnReadChan:
+					err := wsConn.WriteMessage(websocket.BinaryMessage, r)
+					if err != nil {
+						log.Printf("write to wsConn error, quiting handler goroutine: %v\n", err)
+						tcpConn.Close()
+						wsConn.Close()
+						tcpConnReaderExitChan <- struct{}{}
+						wsConnReaderExitChan <- struct{}{}
+						return
+					}
+				case r := <-wsConnReadChan:
+					switch v := comm.ParsePacketType(r).(type) {
+					case *comm.PacketHeartbeat:
+						continue
+					case *comm.PacketTransport:
+						_, err := tcpConn.Write([]byte(*v.Data))
+						if err != nil {
+							log.Printf("write to tcpConn error, quiting handler goroutine: %v\n", err)
+							tcpConn.Close()
+							wsConn.Close()
+							tcpConnReaderExitChan <- struct{}{}
+							wsConnReaderExitChan <- struct{}{}
+							return
+						}
+					default:
+						log.Printf("protocol error, unexpected packet read from server, quiting handler goroutine\n")
+						tcpConn.Close()
+						wsConn.Close()
+						tcpConnReaderExitChan <- struct{}{}
+						wsConnReaderExitChan <- struct{}{}
+						return
+					}
+				case <-errorChan:
+					log.Printf("error happened, quiting handler goroutine: %v\n", err)
+					tcpConn.Close()
+					wsConn.Close()
+					tcpConnReaderExitChan <- struct{}{}
+					wsConnReaderExitChan <- struct{}{}
+					return
+				case <-heartbeatTick:
+					err := wsConn.WriteMessage(websocket.BinaryMessage, (&comm.PacketHeartbeat{}).MustToBytes())
+					if err != nil {
+						log.Printf("write to wsConn error, quiting handler goroutine: %v\n", err)
+						tcpConn.Close()
+						wsConn.Close()
+						tcpConnReaderExitChan <- struct{}{}
+						wsConnReaderExitChan <- struct{}{}
+						return
+					}
+				}
+			}
 		}()
 	}
 }

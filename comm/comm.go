@@ -2,6 +2,15 @@ package comm
 
 import (
 	"encoding/json"
+	"time"
+)
+
+// 一些公用配置
+var (
+	MaxMessageLength          = 4096
+	WsConnExchangeReadTimeout = time.Second * 10
+	Token                     = "random_string_as_token"
+	WssHandshakeTimeout       = time.Second * 10
 )
 
 var (
